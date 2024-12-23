@@ -1,0 +1,2051 @@
+---
+title: "Лабораторная работа 4. Задания"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+#install.packages("mathml")
+#install.packages("extraDistr")
+#install.packages("digest")
+#install.packages("DescTools")
+#install.packages("nloptr")
+#install.packages("optimx")
+```
+
+```{r}
+df <- data.frame( # - создает таблицу df для хранения результатов анализа.
+  method = c(),
+  num_features = c(),
+  iter = c(),
+  MSE_metric = c()
+)
+```
+
+```{r include=FALSE, message=FALSE, warning=FALSE}
+library(plotly)
+library(DescTools)
+library(digest)
+library(extraDistr)
+require(dfoptim)
+
+slog <- \(x) sign(x)*log(abs(x)) # - функция log с учетом знака.
+
+# Функции трассировки (reap и sow):
+# - reap извлекает результаты оптимизации, сохраненные в специальной среде.
+# - sow записывает промежуточные результаты оптимизации (аргументы функции и значения) в специальную среду.
+
+reap <- function(...) {
+  expr <- substitute(...)
+  REAPENV <- new.env()
+  parent.env(REAPENV) <- parent.frame()
+  x <- eval(expr, REAPENV)
+  c(list(x), as.list(REAPENV))
+}
+
+sow <- function(...) {
+  expr <- substitute(alist(...))[-1]
+  for (f in rev(sys.frames())) {
+    if (exists("REAPENV", envir = f)) {
+      re <- get("REAPENV", envir = f)
+      if (is.null(names(expr))) {
+        names(expr) <-
+          if (length(expr) == 1) {
+            "sow"
+          } else {
+            letters[1:length(expr)]
+          }
+      }
+      stopifnot(all(nchar(names(expr)) != 0))
+      for (n in names(expr)) {
+        sx <- eval(expr[[n]], parent.frame())
+        cv <-
+          if (exists(n, envir = re, inherits = FALSE)) {
+            get(n, envir = re)
+          } else {
+            list()
+          }
+        if (length(cv) > 0) {
+          assign(n, append(cv, sx), envir = re)
+        } else {
+          assign(n, sx, envir = re)
+        }
+      }
+      break
+      
+    }
+  }
+  invisible(NULL)
+}
+
+sower <- function(f, n = deparse(substitute(f))) {
+  function(...) {
+    x <- f(...)
+    do.call("sow",  setNames(list(x, c(...)), c(n, paste0(n, '_arg'))))
+    x
+  }
+}
+
+# Функции трассировки для методов оптимизации:
+# optimx_trace_eval, nloptr_trace_eval, constrOptim_trace_eval - выполняют оптимизацию с помощью соответствующих методов (optimx, nloptr, constrOptim) и извлекают результаты с помощью reap. Они также извлекают значения функции, вычисленные во время оптимизации, из среды трассировки.
+seed <- digest2int('Клименко Татьяна Валерьевна')
+
+optimx_trace_eval <- function(...)
+{
+  args <- list(...)
+  f <- args$fn
+  args$fn <- sower(f)
+  res <- do.call(optimx, args) |> reap()
+  df <- res$f_arg |> matrix(ncol = 2, byrow=TRUE) |> as.data.frame() 
+  colnames(df) <- c('x', 'y')
+  df$z <- res$f
+  df <- unique(df)
+  df
+}
+
+nloptr_trace_eval <- function(...)
+{
+  args <- list(...)
+  f <- args$eval_f
+  args$eval_f <- sower(f)
+  res <- do.call(nloptr, args) |> reap()
+  df <- res$f_arg |> matrix(ncol = 2, byrow=TRUE) |> as.data.frame() 
+  colnames(df) <- c('x', 'y')
+  df$z <- res$f
+  df <- unique(df)
+  df
+}
+
+constrOptim_trace_eval <- function(...)
+{
+  args <- list(...)
+  f <- args$f
+  args$f <- sower(f)
+  res <- do.call(constrOptim, args) |> reap()
+  df <- res$f_arg |> matrix(ncol = 2, byrow=TRUE) |> as.data.frame() 
+  colnames(df) <- c('x', 'y')
+  df$z <- res$f
+  df <- unique(df)
+  df
+}
+
+# optimx_trace_path, nloptr_trace_path, constrOptim_trace_path - выполняют оптимизацию с помощью соответствующих методов, но на каждой итерации записывают текущие значения переменных и значение функции с помощью sow.
+
+optimx_trace_path <- function(...)
+{
+  res <- reap({
+    it <- 1
+    repeat {
+      res <- optimx(..., itnmax = it)
+      it <- it + 1
+      sow(x = res$p1,
+          y = res$p2,
+          val = res$value)
+      if (res$convcode %in% c(0,2))
+        break
+    }
+    rm(list = c('it', 'res'))
+    invisible(NULL)
+  })
+  df <- cbind(res$x,res$y,res$val) |> unique() |> as.data.frame()
+  colnames(df) <- c('x', 'y', 'z')
+  df
+}
+
+nloptr_trace_path <- function(...)
+{
+  args <- list(...)
+  res <- reap({
+    it <- 1
+    repeat {
+      args$opts$maxeval <- it
+      res <- do.call(nloptr, args)
+      it <- it + 1
+      sow(x = res$solution[1],
+          y = res$solution[2],
+          val = res$objective)
+      if (res$status != 5)
+        break
+    }
+    rm(list = c('it', 'res'))
+    invisible(NULL)
+  })
+  df <- cbind(res$x, res$y, res$val) |> unique() |> as.data.frame()
+  colnames(df) <- c('x', 'y', 'z')
+  df
+}
+
+constrOptim_trace_path <- function(...)
+{
+  args <- list(...)
+  if(!('control' %in% names(args)))
+    args$control <- list()
+  
+  res <- reap({
+    it <- 1
+    repeat {
+      args$control$maxit <- it
+      res <- do.call(constrOptim, args)
+      it <- it + 1
+      sow(x = res$par[1],
+          y = res$par[2],
+          val = res$value)
+      if (res$convergence == 0)
+        break
+    }
+    rm(list = c('it', 'res'))
+    invisible(NULL)
+  })
+  df <- cbind(res$x,res$y,res$val) |> unique() |> as.data.frame()
+  colnames(df) <- c('x', 'y', 'z')
+  df
+}
+
+# Следующие ф-ции возвращают список, содержащий три элемента:
+# - path: результат работы функции *_trace_path
+# - eval: результат работы функции *_trace_eval
+# - f: функция, которую нужно оптимизировать (извлекается из входных аргументов).
+
+optimx_trace <- function(...)
+{
+  list(path = optimx_trace_path(...),
+       eval = optimx_trace_eval(...),
+       f = list(...)$fn)
+}
+
+nloptr_trace <- function(...)
+{
+  list(path = nloptr_trace_path(...),
+       eval = nloptr_trace_eval(...),
+       f = list(...)$eval_f)
+}
+
+constrOptim_trace <- function(...)
+{
+  list(path = constrOptim_trace_path(...),
+       eval = constrOptim_trace_eval(...),
+       f = list(...)$f)
+}
+
+# Функции визуализации:
+# - animated_path: создает анимированный график поиска решения, показывающий траекторию оптимизации по поверхности функции.
+# - static_path: создает статический график поиска решения, отображающий контуры функции, траекторию поиска, точки вычисления функции, начальную и конечную точку.
+# - gradient_path: создает статический график с градиентом функции вдоль траектории поиска.
+
+animated_path <- function(res)
+{
+  f <- res$f
+  df <- res$path
+  lower <- apply(df, 2, min)
+  upper <- apply(df, 2, max)
+  x <- seq(lower[1], upper[1], length.out = 100)
+  y <- seq(lower[2], upper[2], length.out = 100)
+  n <- nrow(df)
+  z <- outer(x, y, Vectorize(\(p1, p2) c(p1, p2) |> f())) |> t() |> slog()
+  rdf <-lapply(seq_len(nrow(df)),\(i) cbind(df[1:i, ], frame=rep(i,i))) |> dplyr::bind_rows()
+  plot_ly(
+    x = x,
+    y = y,
+    z = z,
+    type = 'contour',
+    ncontours = 35,
+    name = 'уровни функции'
+  ) |>
+    add_trace(
+      x =  rdf$x,
+      y =  rdf$y,
+      frame = rdf$frame,
+      type = 'scatter',
+      mode = 'lines+markers',
+      name = 'оптимизация'
+    ) |>
+    animation_opts(frame = 1000,
+                   transition = 0,
+                   redraw = TRUE)
+}
+
+
+static_path <- function(res)
+{
+  f <- res$f
+  df <- res$path
+  edf <- res$eval
+  
+  cdf <- df
+  cdf <- rbind(cdf, edf)
+  edf <- edf[!duplicated(cdf)[(nrow(df) + 1): (nrow(df) + nrow(edf))],]
+  
+  lower <- apply(cdf, 2, min)
+  upper <- apply(cdf, 2, max)
+  x <- seq(lower[1], upper[1], length.out = 100)
+  y <- seq(lower[2], upper[2], length.out = 100)
+  n <- nrow(df)
+  z <- outer(x, y, Vectorize(\(p1, p2) c(p1, p2) |> f())) |> t() |> slog()
+  plot_ly(x = x,
+          y = y,
+          z = z,
+          type = 'contour',
+          ncontours = 35,
+          name = 'уровни функции') |>
+    add_trace(
+      x =  df$x,
+      y =  df$y,
+      type = 'scatter',
+      mode = 'lines+markers',
+      name = 'оптимизация'
+    ) |>
+    add_trace(
+      x =  df$x[1],
+      y =  df$y[1],
+      type = 'scatter',
+      mode = 'markers',
+      marker = list(color = "purple"),
+      name = 'Start'
+    ) |>
+    add_trace(
+      x =  df$x[n],
+      y =  df$y[n],
+      type = 'scatter',
+      mode = 'markers',
+      name = 'Min',
+      marker = list(color = "red")
+    ) |> add_trace(
+      x =  edf$x,
+      y =  edf$y,
+      type = 'scatter',
+      mode = 'markers',
+      name = 'Вычисления функции',
+      marker = list(color = "red")
+    )
+}
+
+library(DescTools)
+gradient_path <- function(f_g, path)
+{
+  df <- path
+  rescale <- function(x,first,last){(last-first)/(max(x)-min(x))*(x-min(x))+first}
+  
+  lower <- apply(df, 2, min)
+  upper <- apply(df, 2, max)
+  x <- seq(lower[1], upper[1], length.out = 15)
+  y <- seq(lower[2], upper[2], length.out = 15)
+  n <- nrow(df)
+  
+  g_grid <- expand.grid(x = x, y = y)
+  g_val <- apply(g_grid, 1,\(par) {gr <- f_g(par); CartToPol(gr[1],gr[2]) |> unlist()}) |> t()
+  
+  g_grid$theta <- g_val[,2]
+  g_grid$r <- g_val[,1] |> log() |> rescale(0, ((upper - lower) / 15) |> min() )
+
+  fig <- ggplot(g_grid, aes(x, y)) +
+  geom_point() +
+  geom_spoke(aes(angle = theta, radius = r))
+
+   ggplotly(fig) |>
+    add_trace(
+      x =  df$x,
+      y =  df$y,
+      type = 'scatter',
+      mode = 'lines+markers',
+      name = 'оптимизация'
+    ) |>
+    add_trace(
+      x =  df$x[1],
+      y =  df$y[1],
+      type = 'scatter',
+      mode = 'markers',
+      marker = list(color = "purple"),
+      name = 'начало'
+    ) |>
+    add_trace(
+      x =  df$x[n],
+      y =  df$y[n],
+      type = 'scatter',
+      mode = 'markers',
+      name = 'Min',
+      marker = list(color = "red")
+    )
+}
+```
+
+```{r include=FALSE, message=FALSE}
+library(digest)
+library(extraDistr)
+require(dfoptim)
+
+base_seed <- digest2int('Дроздовская Полина')
+listN <- function(...){ # используется для создания списка из аргументов, переданных ей.
+    anonList <- list(...)
+    names(anonList) <- as.character(substitute(list(...)))[-1]
+    anonList
+}
+```
+
+# Процедура анализа
+
+Для всех методов требуемых в условии
+
+1.  Найти минимум функции простым вызовом метода.
+2.  С определить колличество вычислений функции.
+3.  С помощью функций trace\_\* найти путь поиска решения
+4.  Построить анимированный график поиска решения
+5.  Построить график поиска решения с точками, в которых была вычислена функция
+6.  Построить график поиска решения с градиентом.
+
+Собрать итоговую таблицу (data.frame), в которой строки соответствуют методам, а столбцы (значение функции, значение переменных, колличество вызовов функции)
+
+# Задание 1. Главное не поскользнуться
+
+```{r}
+frac <- \(a,b)a/b
+```
+
+```{r include=FALSE}
+task1_gen <- function()
+{
+  set.seed(seed) # - устанавливает начальное значение для генератора случайных чисел
+  la <- rdunif(1, 7, 12) |> as.integer()
+  ca <- rdunif(1, 7, 12) |> as.integer()
+  a <- rdunif(1, 1, 3) |> as.integer()
+  b <- rdunif(1, 1, 5) |> as.integer()
+  o <- rdunif(1, 1, 4) |> as.integer()
+  expr <- 
+    substitute(la * frac(1L, 1L + exp(-x)) + ca * cos(o*x) + a * x ^ 2L - b * x)
+
+  f <- \(x) eval(expr) # - принимает x и вычисляет значение выражения expr
+  listN(f, expr)
+}
+task1 <- task1_gen()
+```
+
+```{r}
+task1$expr
+```
+
+```{r}
+x <- seq(-2,2, by = 0.1)
+y <- task1$f(x)
+
+op <- optimise(task1$f, c(-5, 5)) # Метод золотого сечения
+
+data <- data.frame(x, y)
+fig <- plot_ly(data, x = ~x, y = ~y, type = 'scatter', mode = 'lines', name = "Function") |>
+  add_markers(x = op$minimum, y = task1$f(op$minimum))
+fig
+```
+
+1.  Найти минимум функции
+2.  Построить график, выделить точку минимума
+
+# Задание 2. Горбы и ямы
+
+```{r include=FALSE}
+
+task2_gen <- function()
+{
+  set.seed(seed+2)
+  a <- rdunif(1, 5, 10) |> as.integer()
+  c <- rdunif(1, 5, 10) |> as.integer()
+  b <- (sqrt(a*c) - 1) |> ceiling() |> as.integer()
+  
+  ae1 <- rdunif(1, 5, 10) |> as.integer()
+  ae2 <- rdunif(1, 5, 10) |> as.integer()
+  ae3 <- rdunif(1, 5, 10) |> as.integer()
+  x01 <- rdunif(1, -3, 3) |> as.integer()
+  x02 <- rdunif(1, -3, 3) |> as.integer()
+  x03 <- rdunif(1, -3, 3) |> as.integer()
+  y01 <- rdunif(1, -3, 3) |> as.integer()
+  y02 <- rdunif(1, -3, 3) |> as.integer()
+  y03 <- rdunif(1, -3, 3) |> as.integer()
+  sx1 <- rdunif(1, 1, 5) |> as.integer()
+  sx2 <- rdunif(1, 1, 5) |> as.integer()
+  sx3 <- rdunif(1, 1, 5) |> as.integer()
+  sy1 <- rdunif(1, 1, 5) |> as.integer()
+  sy2 <- rdunif(1, 1, 5) |> as.integer()
+  sy3 <- rdunif(1, 1, 5) |> as.integer()
+  
+  expr <- substitute(
+    a * x ^ 2L + 2L * b * x * y + c * y ^ 2L + ae1 * exp(-(frac((x - x01) ^ 2L,sx1) + frac((y - y01) ^ 2L , sy1))) + ae2 * exp(-(frac((x - x02) ^ 2L,sx2) + frac((y - sy2) ^ 2L , sy2))) + ae3 * exp(-(frac((x - x03) ^ 2L , sx3) + frac((y - y03) ^ 2L , sy3))))
+  
+  f <- \(par) eval(expr, list(x = par[1], y = par[2]))
+  listN(f, expr)
+}
+task2 <- task2_gen()
+```
+
+```{r}
+task2$expr
+```
+
+Найти безусловный минимум функции двух переменных.
+
+С помощью методов: Nelder-Mead, PRAXIS, BFGS, CG.
+
+(Для градиентных методов выразить градиент самостоятельно)
+
+Вызвать функцию можно через объект
+
+```{r}
+library(Deriv)
+f = function(par){
+    x <- par[1]
+    y <- par[2]
+    10 * x ^ 2 + 18 * x * y + 10 * y ^ 2 + 8 * exp(-((((x-1)^2)/5) + ((y-1)^2)/3)) + 10 * exp(-((((x-3)^2)/1) + ((y-5)^2)/5)) + 10 * exp(-((((x-3)^2)/1) + ((y-2)^2)/5))
+}
+
+df_dx <- Deriv(f, "x")
+df_dy <- Deriv(f, "y")
+
+df_dx
+```
+
+```{r}
+task2 <- list(
+  f = function(par){
+    x <- par[1]
+    y <- par[2]
+    10 * x ^ 2 + 18 * x * y + 10 * y ^ 2 + 8 * exp(-((((x-1)^2)/5) + ((y-1)^2)/3)) + 10 * exp(-((((x-3)^2)/1) + ((y-5)^2)/5)) + 10 * exp(-((((x-3)^2)/1) + ((y-2)^2)/5))
+    
+  },
+  
+  gradF = function(par){
+    x <- par[1]
+    y <- par[2]
+
+    dx <- 20 * x + 18 * y - 8 * exp(-((((x-1)^2)/5) + ((y-1)^2)/3)) * (2 * (x - 1) / 5) - 10 * exp(-((((x-3)^2)/1) + ((y-5)^2)/5)) * (2 * (x - 3) / 1) - 10 * exp(-((((x-3)^2)/1) + ((y-2)^2)/5)) * (2 * (x - 3) / 1)
+    dy <- 18 * x + 20 * y - 8 * exp(-((((x-1)^2)/5) + ((y-1)^2)/3)) * (2 * (y - 1) / 3) - 10 * exp(-((((x-3)^2)/1) + ((y-5)^2)/5)) * (2 * (y - 5) / 5) - 10 * exp(-((((x-3)^2)/1) + ((y-2)^2)/5)) * (2 * (y - 2) / 5)
+    c(dx, dy)
+  },
+  
+  hess_f = function(par){
+      x <- par[1]
+      y <- par[2]
+      ddx <- 20 - 8 * exp(-((x-1)^2/5 + (y-1)^2/3)) * (2/5) + 8 * exp(-((x-1)^2/5 + (y-1)^2/3)) * (2*(x-1)^2/25) - 20 * exp(-((x-3)^2 + (y-5)^2/5)) * (2*(x-3)^2) - 20 * exp(-((x-3)^2 + (y-2)^2/5)) * (2*(x-3)^2)
+    
+      ddy <- 20 - 8 * exp(-((x-1)^2/5 + (y-1)^2/3)) * (2/3) + 8 * exp(-((x-1)^2/5 + (y-1)^2/3)) * (2*(y-1)^2/9) - 10 * exp(-((x-3)^2 + (y-5)^2/5)) * (2*(y-5)^2/25) - 10 * exp(-((x-3)^2 + (y-2)^2/5)) * (2*(y-2)^2/25)
+    
+      dxdy <- 18 - 8 * exp(-((x-1)^2/5 + (y-1)^2/3)) * (2*(x-1)*(y-1)/15) - 20 * exp(-((x-3)^2 + (y-5)^2/5)) * (2*(x-3)*(y-5)/5) - 20 * exp(-((x-3)^2 + (y-2)^2/5)) * (2*(x-3)*(y-2)/5)
+    
+      rbind(c(ddx, dxdy), c(dxdy, ddy)) # 
+  }
+)
+```
+
+```{r}
+start <- c(-5,5)
+```
+
+#### Nelder-Mead (simplex)
+
+```{r}
+library(nloptr)
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+#animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+df <- data.frame()
+row <- data.frame(
+  method = "Nelder-Mead",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### Метод Брейнта (PRAXIS) (Principal Axis)
+
+Метод координатного спуска: • PRAXIS использует метод координатного спуска, где функция минимизируется по одной координате за раз. • На каждой итерации выбирается направление минимизации, и функция минимизируется по этому направлению.
+
+Ротация осей: • После минимизации по всем координатам, метод PRAXIS выполняет ротацию осей, чтобы улучшить направление поиска. • Ротация основана на идее использования линейной комбинации текущих координат для создания новых направлений, которые могут привести к более быстрому поиску минимума.
+
+Использование квадратичной аппроксимации: • PRAXIS пытается аппроксимировать целевую функцию квадратичной функцией, чтобы более точно определить направление и шаг минимизации. • Это позволяет методу адаптироваться к форме функции и улучшить сходимость.
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  opts = list(algorithm = 'NLOPT_LN_PRAXIS', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r warning=FALSE, message=FALSE}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  opts = list(algorithm = 'NLOPT_LN_PRAXIS', xtol_rel = 1.0e-8)
+)
+
+#animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "PRAXIS",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS (Broyden-Fletcher-Goldfarb-Shanno)
+
+BFGS (Broyden-Fletcher-Goldfarb-Shanno – Бройдена — Флетчера — Гольдфарба — Шанно) является квазиньютоновским методом оптимизации.
+
+Аппроксимация гессиана -\> вычисление градиента
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r warning=FALSE, message=FALSE}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8) # BFGS - Метод ограниченной памяти Бройдена-Флетчера-Голдфарба-Шанно (Broyden-Fletcher-Goldfarb-Shanno). Это алгоритм оптимизации второго порядка, который использует информацию о градиенте и Гессиане целевой ф-ции для поиска оптимального решения.
+)
+
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+```{r}
+
+```
+
+#### Метод сопряженных градиентов (RCG) (Restarted Conjugate Gradient)
+
+Метод сопряженных градиентов используется для минимизации квадратичных функций и может быть эффективно применен к общим нелинейным задачам. Основная идея заключается в том, чтобы двигаться не в направлении антиградиента, как в методе градиентного спуска, а в направлениях, которые "сопряжены" друг с другом, что позволяет существенно ускорить сходимость.
+
+```{r warning=FALSE, message=FALSE}
+library(optimx)
+Res <- optimx(
+  par = start,
+  fn = task2$f,
+  gr = task2$gradF,
+  hess = task2$hess_f,
+  method = 'CG'
+)
+Res
+```
+
+```{r warning=FALSE, message=FALSE}
+res <- optimx_trace(
+  par = start,
+  fn = task2$f,
+  gr = task2$gradF,
+  hess = task2$hess_f,
+  method = 'CG'
+)
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF,res$path)
+
+```
+
+```{r}
+row <- data.frame(
+  method = "CG",
+  num_features = c(2),
+  iter = c(Res$niter),
+  value = Res$value
+)
+
+df <- rbind(df, row)
+df
+```
+
+Провести анализ
+
+# задание 3. Окружен, но не сломлен
+
+Найти условный минимум функции двух переменных, с ограничениями.
+
+```{r include=FALSE}
+
+task3_linear <- function()
+{
+  set.seed(seed+3)
+  a <- rdunif(1, 2, 10) |> as.integer()
+  b <- rdunif(1,-10, 10) |> as.integer()
+  c <- rdunif(1,-10, 10) |> as.integer()
+  f <- rdunif(1, -10, 10) |> as.integer()
+  f1 <- round(f/2L) |> as.integer()
+  first <- substitute(a * x + b * y <= f)
+  second <- substitute(frac(x, a) + c * y >= -f1)
+  list(first = first, second = second)
+}
+task3_quadratic <- function()
+{
+  set.seed(seed+3)
+  a <- rdunif(1, 6, 15) |> as.integer()
+  c <- rdunif(1, 2, 10) |> as.integer()
+  k <- rdunif(1, 1, 5) |> as.integer()
+  b <- (sqrt(a * c) - 1) |> ceiling() |> as.integer()
+  first <- substitute(frac(x ^ 2L, a) + frac(y ^ 2L, c) - frac(x * y, b) <= 6L)
+  second <- substitute(frac(x ^ 2L, c) + frac(y ^ 2L, a * k) + frac(x * y, b) <= 3L)
+  listN(first, second)
+}
+
+task3_gen <- function()
+  if(sample(c(TRUE,FALSE),1)) task3_quadratic() else task3_linear()
+
+task3 <- task3_gen()
+```
+
+Решить задачу минимизации с ограничениями
+
+```{r}
+task3
+```
+
+С помощью методов: cobyla, mma, ccsa, sslqp. Провести анализ.
+
+#### COBYLA (Constrained Optimization BY Linear Approximations)
+
+Без градиентов: COBYLA не требует вычисления градиентов целевой функции и ограничений, что делает его удобным для задач, где вычисление производных затруднительно или невозможно.
+
+Линейные аппроксимации: Алгоритм использует линейные аппроксимации для ограничений, обновляя их на каждой итерации.
+
+Симплекс-метод: COBYLA использует подход, похожий на метод Нелдера-Мида (симплекс-метод), для обновления текущего решения.
+
+```{r}
+constr_ineq <- function(par){
+  x <- par[1]
+  y <- par[2]
+  c((x^2 / 9) + (y^2 / 4) - (x * y / 5) - 6, (x^2 / 4) + (y^2 / (9 * 4)) + (x * y / 5) - 3)
+}
+```
+
+```{r}
+Res <- nloptr(
+  x0 = start, # Начальное приближение для переменных решения. start — это вектор начальных значений.
+  eval_f = task2$f, # Целевая функция, которую нужно минимизировать. 
+  eval_g_ineq = constr_ineq, # Неравенства, которые должны быть выполнены в процессе оптимизации. constr_ineq — это функция, которая возвращает вектор значений ограничений.
+  opts = list( # Список опций для настройки алгоритма оптимизации. В данном случае:
+    algorithm = 'NLOPT_LN_COBYLA', # Используется алгоритм COBYLA (Constrained Optimization BY Linear Approximations).
+    xtol_rel = 1.0e-8 # Относительная допустимая ошибка в значениях переменных, которая является критерием остановки.
+  )
+)
+
+Res
+```
+
+Call: Вызов функции nloptr с переданными параметрами. Minimization using NLopt version 2.7.1: Используется версия 2.7.1 пакета NLopt. NLopt solver status: 5: Статус завершения оптимизации. В данном случае статус 5 означает, что оптимизация остановлена, так как достигнуто максимальное количество итераций. Number of Iterations....: 100: Количество итераций, выполненных алгоритмом. Termination conditions: xtol_rel: 1e-08: Условия завершения оптимизации, здесь указана относительная точность xtol_rel. Number of inequality constraints: 2: Количество неравенств, учтенных в задаче. Number of equality constraints: 0: Количество равенств, учтенных в задаче. Current value of objective function: 0.771091032441792: Текущее значение целевой функции, достигнутое в результате оптимизации. Current value of controls: -0.0707955 0.01776407: Текущее значение переменных управления (оптимизируемых переменных), найденное алгоритмом.
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_g_ineq = constr_ineq,
+  opts = list(
+    algorithm = 'NLOPT_LN_COBYLA',
+    xtol_rel = 1.0e-8
+  )
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "COBYLA",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### Метод перемещающихся асимптот (MMA, Moving Asymptotes Method)
+
+Основные идеи метода MMA:
+
+-   Локальные аппроксимации: В каждом шаге метода целевая функция и ограничения аппроксимируются с помощью специально подобранных функций (чаще всего, рациональных функций), которые строятся таким образом, чтобы гарантировать выпуклость аппроксимированной задачи.
+-   Перемещающиеся асимптоты: Эти аппроксимации включают перемещающиеся асимптоты, которые обновляются на каждой итерации. Асимптоты помогают контролировать форму аппроксимаций и улучшают сходимость алгоритма.
+-   Параметры управления: Метод использует параметры управления, которые регулируют перемещение асимптот и обеспечивают баланс между точностью и стабильностью аппроксимаций.
+
+Алгоритм MMA:
+
+1)  Инициализация: Задаются начальные значения переменных x0 и начальные параметры асимптот.
+2)  Построение аппроксимаций: В каждой итерации строятся аппроксимации целевой функции и ограничений с использованием текущих значений переменных и асимптот.
+3)  Решение субзадачи: Полученная аппроксимированная задача решается с использованием методов оптимизации для выпуклых задач.
+4)  Обновление переменных: Значения переменных обновляются на основе решения субзадачи.
+5)  Обновление асимптот: Асимптоты перемещаются, чтобы улучшить аппроксимации на следующем шаге.
+6)  Проверка условия остановки: Алгоритм останавливается при достижении заданных условий остановки, таких как максимальное число итераций или достижение заданной точности.
+7)  Повторение: Шаги 2-6 повторяются до достижения условия остановки.
+
+```{r}
+# constr_ineq_jac - функция, которая возвращает якобиан неравенств. Якобиан — это матрица первых производных функций ограничений. В данном примере функция принимает вектор par из двух элементов (x, y) и возвращает матрицу 2x2, где каждая строка представляет собой градиент одного из ограничений.
+constr_ineq_jac <- function(par){
+  x <- par[1]
+  y <- par[2]
+  rbind(c(2*x/9, y/2 - x/5),
+        c(x/2 + y/5, y/36 + x/5))
+}
+
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF, # Градиент целевой функции. Функция task2$gradF возвращает вектор первых производных целевой функции.
+  eval_g_ineq = constr_ineq, # Неравенства, которые должны быть выполнены в процессе оптимизации. constr_ineq — это функция, которая возвращает вектор значений ограничений.
+  eval_jac_g_ineq = constr_ineq_jac, # Якобиан неравенств. constr_ineq_jac — это функция, которая возвращает матрицу первых производных функций ограничений.
+  opts = list(
+    algorithm = 'NLOPT_LD_MMA',
+    xtol_rel = 1.0e-8
+  )
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  eval_g_ineq = constr_ineq,
+  eval_jac_g_ineq = constr_ineq_jac,
+  opts = list(
+    algorithm = 'NLOPT_LD_MMA',
+    xtol_rel = 1.0e-8
+  )
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "MMA",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### CCSA (Constrained Optimization by Quadratic Approximations)
+
+Основные идеи метода CCSA:
+
+-   Квадратичные аппроксимации: Целевая функция и ограничения аппроксимируются квадратичными функциями, чтобы создать выпуклую аппроксимацию исходной задачи.
+-   Локальные аппроксимации: Аппроксимации строятся на основе текущего приближения решения и обновляются на каждой итерации.
+-   Решение выпуклой задачи: Аппроксимированная задача является выпуклой и может быть решена с использованием стандартных методов оптимизации для выпуклых задач.
+
+Алгоритм CCSA:
+
+1)  Инициализация: Задаются начальные значения переменных x0
+2)  Построение аппроксимаций: В каждой итерации строятся квадратичные аппроксимации целевой функции и ограничений на основе текущих значений переменных.
+3)  Решение субзадачи: Полученная выпуклая аппроксимированная задача решается с использованием методов оптимизации для выпуклых задач.
+4)  Обновление переменных: Значения переменных обновляются на основе решения субзадачи.
+5)  Проверка условия остановки: Алгоритм останавливается при достижении заданных условий остановки, таких как максимальное число итераций или достижение заданной точности.
+6)  Повторение: Шаги 2-5 повторяются до достижения условия остановки.
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  eval_g_ineq = constr_ineq, # Неравенства, которые должны быть выполнены в процессе оптимизации. constr_ineq — это функция, которая возвращает вектор значений ограничений.
+  eval_jac_g_ineq = constr_ineq_jac, # Якобиан неравенств. constr_ineq_jac — это функция, которая возвращает матрицу первых производных функций ограничений.
+  opts = list(
+    algorithm = 'NLOPT_LD_CCSAQ', # - оптимизация с ограничениями с использованием последовательных квадратичных аппроксимаций
+    xtol_rel = 1.0e-8
+  )
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  eval_g_ineq = constr_ineq,
+  eval_jac_g_ineq = constr_ineq_jac,
+  opts = list(
+    algorithm = 'NLOPT_LD_CCSAQ',
+    xtol_rel = 1.0e-8
+  )
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "CCSA",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### SSLQP (Sequential Semidefinite Linear Quadratic Programming)
+
+Основные идеи метода SLSQP:
+
+-   Квадратичные аппроксимации: В каждой итерации целевая функция и ограничения аппроксимируются квадратичными функциями.
+-   Метод наименьших квадратов: В процессе решения задачи используется метод наименьших квадратов для аппроксимации ограничений.
+-   Пошаговое улучшение: Алгоритм последовательно улучшает текущее приближение решения путем решения задачи квадратичного программирования (QP).
+
+Алгоритм SLSQP:
+
+1)  Инициализация: Задаются начальные значения переменных x0.
+2)  Построение аппроксимаций: В каждой итерации строятся квадратичные аппроксимации для целевой функции и ограничений на основе текущих значений переменных.
+3)  Решение задачи QP: Полученная задача квадратичного программирования решается с использованием методов оптимизации для QP.
+4)  Обновление переменных: Значения переменных обновляются на основе решения задачи QP.
+5)  Проверка условия остановки: Алгоритм останавливается при достижении заданных условий остановки, таких как максимальное число итераций или достижение заданной точности.
+6)  Повторение: Шаги 2-5 повторяются до достижения условия остановки.
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  eval_g_ineq = constr_ineq, # Неравенства, которые должны быть выполнены в процессе оптимизации.
+  eval_jac_g_ineq = constr_ineq_jac, # Якобиан неравенств.
+  opts = list(
+    algorithm = 'NLOPT_LD_SLSQP',
+    xtol_rel = 1.0e-8
+  )
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  eval_g_ineq = constr_ineq,
+  eval_jac_g_ineq = constr_ineq_jac,
+  opts = list(
+    algorithm = 'NLOPT_LD_SLSQP',
+    xtol_rel = 1.0e-8
+  )
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "SSLQP",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+# Задание 4. За стеной
+
+Свести задачу условной минимизации к безусловной
+
+Сведение задачи условной минимизации к последовательности задач безусловной минимизации путем использования барьерных или штрафных функций (метод последовательной безусловной минимизации).
+
+```{r include=FALSE}
+
+task4_gen <- function()
+{
+  set.seed(seed+4)
+  x_min <- rdunif(1, -10, 10) |> as.integer()
+  x_max <- rdunif(1,x_min + 2, x_min + 1 + 10) |> as.integer()
+  y_min <- rdunif(1, -10, 10) |> as.integer()
+  y_max <- rdunif(1, y_min + 1, y_min + 1 + 10) |> as.integer()
+  listN(x_min,x_max,y_min,y_max)
+}
+
+task4 <- task4_gen()
+
+```
+
+Решить задачу минимизации с ограничениями с помощью методов: Nelder-Mead, tnewton, BFGS, Rcg.
+
+$$\begin{cases}
+      `r task4$x_min` \leq x \leq `r task4$x_max` \\
+      `r task4$y_min` \leq y \leq `r task4$y_max`
+\end{cases}$$
+
+```{r}
+task4
+```
+
+```{r}
+start <- c(5, -3)
+lo <- c(task4$x_min |> as.numeric(), task4$y_min |> as.numeric()) # нижние границы для переменных x и y, преобразованные в числовой формат.
+up <- c(task4$x_max |> as.numeric(), task4$y_max |> as.numeric()) # верхние границы для переменных x и y, преобразованные в числовой формат.
+```
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  lb = lo,
+  ub = up,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  lb = lo,
+  ub = up,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "Nelder-Mead (Borders)",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### tnewton
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  lb = lo,
+  ub = up,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8) # NLOPT_LD_TNEWTON_PRECOND_RESTART — это один из алгоритмов для нелинейной оптимизации. Этот алгоритм относится к классу методов Ньютона, но с предобуславливанием и возможностью перезапуска.
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  lb = lo,
+  ub = up,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "tnewton (Borders)",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  lb = lo,
+  ub = up,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task2$f,
+  eval_grad_f = task2$gradF,
+  lb = lo,
+  ub = up,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task2$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS (Borders)",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### RCG
+
+```{r}
+# Res <- optimx(
+#   par = start,
+#   fn = task2$f,
+#   gr = task2$gradF,
+#   hess = task2$hess_f,
+#   lower = lo,
+#   upper = up,
+#   method = 'Rcgmin'
+# )
+# 
+# Res
+```
+
+```{r}
+# res <- optimx_trace(
+#   par = start,
+#   fn = task2$f,
+#   gr = task2$gradF,
+#   hess = task2$hess_f,
+#   lower = lo,
+#   upper = up,
+#   method = 'Rcgmin'
+# )
+```
+
+```{r warning=FALSE, message=FALSE}
+# animated_path(res)
+
+# static_path(res)
+
+# gradient_path(task2$gradF,res$path)
+```
+
+```{r}
+# row <- data.frame(
+#   method = "Rcg (Boarders)",
+#   num_features = c(2),
+#   iter = c(Res$niter),
+#   value = Res$value
+# )
+# 
+# df <- rbind(df, row)
+# df
+```
+
+Провести анализ
+
+# Задание 5. Гладко было на бумаге, да забыли про овраги
+
+```{r include=FALSE}
+task5_gen <- function()
+{
+  set.seed(seed+5)
+  a1 <- rdunif(1, 5, 15) |> as.integer()
+  b1 <- rdunif(1, 5, 15) |> as.integer()
+  c1 <- rdunif(1, 5, 15) |> as.integer()
+  a2 <- rdunif(1, 1, 5) |> as.integer()
+  b2 <- rdunif(1, 1, 5) |> as.integer()
+  c2 <- rdunif(1, 1, 5) |> as.integer()
+  expr <-
+    substitute((a1 * x + b1 * y - c1) ^ 4L + (a2 * x + b2 * y - c2) ^ 4L)
+  
+  f <- \(par) eval(expr, list(x = par[1], y = par[2]))
+  listN(f, expr)
+}
+task5 <- task5_gen()
+```
+
+Найти безусловный минимум сильно вытянутой вдоль функции двух переменных с помощью методов: Nelder-Mead, tnewton, BFGS, varmetric. Провести анализ.
+
+```{r}
+task5$expr
+```
+
+```{r}
+task5 <- list(
+  f = function(par){
+    x <- par[1]
+    y <- par[2]
+    
+    (6*x + 7*y - 8)^4 + (5*x + 4*y -4)^4
+  }, 
+  
+  gradF = function(par){
+    x <- par[1]
+    y <- par[2]
+    
+    dx <- 24*(6*x + 7*y - 8)^3 + 20*(5*x + 4*y -4)^3
+    dy <- 28*(6*x + 7*y - 8)^3 + 16*(5*x + 4*y -4)^3
+    c(dx, dy)
+  }
+)
+```
+
+#### Nelder-Mead
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task5$f,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task5$f,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task5$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "Nelder-Mead (Ravines)", # Овраги
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task5$f,
+  eval_grad_f = task5$gradF,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r warning=FALSE, message=FALSE}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task5$f,
+  eval_grad_f = task5$gradF,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task5$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS (Ravines)",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### tnewton
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task5$f,
+  eval_grad_f = task5$gradF,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task5$f,
+  eval_grad_f = task5$gradF,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task5$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "tnewton (Ravines)",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### varmetric
+
+Выполняет пробные шаги
+
+```{r}
+Res <- nloptr(
+  x0 = start,
+  eval_f = task5$f,
+  eval_grad_f = task5$gradF,
+  opts = list(algorithm = 'NLOPT_LD_VAR2', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+res <- nloptr_trace(
+  x0 = start,
+  eval_f = task5$f,
+  eval_grad_f = task5$gradF,
+  opts = list(algorithm = 'NLOPT_LD_VAR2', xtol_rel = 1.0e-8)
+)
+```
+
+```{r warning=FALSE, message=FALSE}
+animated_path(res)
+
+static_path(res)
+
+gradient_path(task5$gradF, res$path)
+```
+
+```{r}
+row <- data.frame(
+  method = "varmetric (Ravines)",
+  num_features = c(2),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+# Задание 6. Дальше больше
+
+```{r include=FALSE}
+task6_gen <- function()
+{
+  set.seed(seed+6)
+  b <- rdunif(1, 5, 15) |> as.integer()
+  L50 <- rdunif(50, 5, 15) |> as.integer()
+  L100 <- rdunif(100, 5, 15) |> as.integer()
+  L500 <- rdunif(500, 5, 15) |> as.integer()
+  L1000 <- rdunif(1000, 5, 15) |> as.integer()
+  f50 <- \(par) sum(par*L50 - b)^2
+  f100 <- \(par) sum(par*L100 - b)^2
+  f500 <- \(par) sum(par*L500 - b)^2
+  f1000 <- \(par) sum(par*L1000 - b)^2
+  listN(f50,f100,f500,f1000,L50,L100,L500,L1000,b)
+}
+
+task6 <- task6_gen()
+```
+
+Провести анализ для всех предложенных функций (n=50,100,500,1000) $$F=(\sum_{i=1}^N{L_ix_i}-b)^2$$
+
+```{r}
+task6_func <- list(
+  f50 = function(par){
+    (sum(par * task6$L50) - task6$b)^2
+  },
+  
+  df50 = function(par){
+    s <- sum(par * task6$L50) - task6$b
+    2 * s * task6$L50
+  },
+  
+  hf50 = function(par){
+    hessian_matrix <- matrix(0, nrow = 50, ncol = 50)
+    for (i in 1:50) {
+      for (j in 1:50) {
+        hessian_matrix[i, j] <- 2 * task6$L50[i] * task6$L50[j]
+      }
+    }
+    return(hessian_matrix)
+  },
+  
+  f100 = function(par){
+    (sum(par * task6$L100) - task6$b)^2
+  },
+  
+  df100 = function(par){
+    s <- sum(par * task6$L100) - task6$b
+    s * 2 * task6$L100
+  },
+  
+  hf100 = function(par){
+    hessian_matrix <- matrix(0, nrow = 100, ncol = 100)
+    for (i in 1:100) {
+      for (j in 1:100) {
+        hessian_matrix[i, j] <- 2 * task6$L100[i] * task6$L100[j]
+      }
+    }
+    return(hessian_matrix)
+  },
+  
+  f500 = function(par){
+    (sum(par * task6$L500) - task6$b)^2
+  },
+  
+  df500 = function(par){
+    s <- sum(par * task6$L500) - task6$b
+    s * 2 * task6$L500
+  },
+  
+  hf500 = function(par){
+    hessian_matrix <- matrix(0, nrow = 500, ncol = 500)
+    for (i in 1:500) {
+      for (j in 1:500) {
+        hessian_matrix[i, j] <- 2 * task6$L500[i] * task6$L500[j]
+      }
+    }
+    return(hessian_matrix)
+  },
+  
+  f1000 = function(par){
+    (sum(par * task6$L1000) - task6$b)^2
+  },
+  
+  df1000 = function(par){
+    s <- sum(par * task6$L1000) - task6$b
+    s * 2 * task6$L1000
+  },
+  
+  hf1000 = function(par){
+    hessian_matrix <- matrix(0, nrow = 1000, ncol = 1000)
+    for (i in 1:1000) {
+      for (j in 1:1000) {
+        hessian_matrix[i, j] <- 2 * task6$L1000[i] * task6$L1000[j]
+      }
+    }
+    return(hessian_matrix)
+  }
+)
+```
+
+Гиперэллипсоиды для 50, 100, 1000 переменных. С помощью методов: Nelder-Mead, tnewton, BFGS, Rcg.
+
+### 50
+
+#### Nelder-Mead
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 50),
+  eval_f = task6_func$f50,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Nelder-Mead (50)",
+  num_features = c(50),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### tnewton
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 50),
+  eval_f = task6$f50,
+  eval_grad_f = task6_func$df50,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "tnewton (50)",
+  num_features = c(50),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 50),
+  eval_f = task6_func$f50,
+  eval_grad_f = task6_func$df50,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS (50)",
+  num_features = c(50),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### Rcg
+
+```{r}
+Res <- optimx(
+  par = rep(0, 50),
+  fn = task6_func$f50,
+  gr = task6_func$df50,
+  hess = task6_func$hf50,
+  method = 'Rcgmin'
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Rcg (50)",
+  num_features = c(50),
+  iter = c(Res$niter),
+  value = Res$value
+)
+
+
+df <- rbind(df, row)
+df
+```
+
+### 100
+
+#### Nelder-Mead
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 100),
+  eval_f = task6_func$f100,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Nelder-Mead (100)",
+  num_features = c(100),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### tnewton
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 100),
+  eval_f = task6_func$f100,
+  eval_grad_f = task6_func$df100,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "tnewton (100)",
+  num_features = c(100),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 100),
+  eval_f = task6_func$f100,
+  eval_grad_f = task6_func$df100,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS (100)",
+  num_features = c(100),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### Rcg
+
+```{r}
+Res <- optimx(
+  par = rep(0, 100),
+  fn = task6_func$f100,
+  gr = task6_func$df100,
+  hess = task6_func$hf100,
+  method = 'Rcgmin'
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Rcg (100)",
+  num_features = c(100),
+  iter = c(Res$niter),
+  value = Res$value
+)
+
+df <- rbind(df, row)
+df
+```
+
+### 500
+
+#### Nelder-Mead
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 500),
+  eval_f = task6_func$f500,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Nelder-Mead (500)",
+  num_features = c(500),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### tnewton
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 500),
+  eval_f = task6_func$f500,
+  eval_grad_f = task6_func$df500,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "tnewton (500)",
+  num_features = c(500),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 500),
+  eval_f = task6_func$f500,
+  eval_grad_f = task6_func$df500,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS (500)",
+  num_features = c(500),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### Rcg
+
+```{r}
+Res <- optimx(
+  par = rep(0, 500),
+  fn = task6_func$f500,
+  gr = task6_func$df500,
+  hess = task6_func$hf500,
+  method = 'Rcgmin'
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Rcg (500)",
+  num_features = c(500),
+  iter = c(Res$niter),
+  value = Res$value
+)
+
+df <- rbind(df, row)
+df
+```
+
+### 1000
+
+#### Nelder-Mead
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 1000),
+  eval_f = task6_func$f1000,
+  opts = list(algorithm = 'NLOPT_LN_NELDERMEAD', xtol_rel = 1.0e-8)
+  )
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Nelder-Mead (1000)",
+  num_features = c(1000),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### tnewton
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 1000),
+  eval_f = task6_func$f1000,
+  eval_grad_f = task6_func$df1000,
+  opts = list(algorithm = 'NLOPT_LD_TNEWTON_PRECOND_RESTART', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "tnewton (1000)",
+  num_features = c(1000),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### BFGS
+
+```{r}
+Res <- nloptr(
+  x0 = rep(0, 1000),
+  eval_f = task6_func$f1000,
+  eval_grad_f = task6_func$df1000,
+  opts = list(algorithm = 'NLOPT_LD_LBFGS', xtol_rel = 1.0e-8)
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "BFGS (1000)",
+  num_features = c(1000),
+  iter = c(Res$iterations),
+  value = Res$objective
+)
+
+df <- rbind(df, row)
+df
+```
+
+#### Rcg
+
+```{r}
+Res <- optimx(
+  par = rep(0, 1000),
+  fn = task6_func$f1000,
+  gr = task6_func$df1000,
+  hess = task6_func$hf1000,
+  method = 'Rcgmin'
+)
+
+Res
+```
+
+```{r}
+row <- data.frame(
+  method = "Rcg (1000)",
+  num_features = c(1000),
+  iter = c(Res$niter),
+  value = Res$value
+)
+
+df <- rbind(df, row)
+df
+```
+
+# Задание 7. Реальный мир
+
+найти минимум любым доступным методом (реализованным в R), для 3-ех функций из репозитория
+
+Провести анализ.
+
+```{r}
+sample <- function (x, size, replace = FALSE, prob = NULL) {
+  if (length(x) == 1L && is.numeric(x) && is.finite(x) && x >= 1) {
+    if (missing(size)) 
+      size <- x
+    sample.int(x, size, replace, prob)
+  }
+  else {
+    if (missing(size)) 
+      size <- length(x)
+    x[sample.int(length(x), size, replace, prob)]
+  }
+}
+```
+
+```{r}
+task7_gen <- function()
+{
+  set.seed(seed + 7)
+  get_fun <- function(path)
+  {
+    source(path, local = TRUE)
+    as.list(environment())
+  }
+  l <- lapply('Box' |> dir(recursive = TRUE, full.names = TRUE) |> sample(3), get_fun)
+  names(l) <- sapply(seq_len(3), \(i) paste0('t', i))
+  l
+}
+task7 <- task7_gen()
+```
+
+Рассмотрим пример. Ограничения для функции
+
+```{r}
+task7$t1$get_xl(2)
+task7$t1$get_xu(2)
+```
+
+Минимальное значение функции и аргумент при котором оно реализуется
+
+```{r}
+task7$t1$get_xmin(2)
+task7$t1$get_fmin(2)
+```
+
+```{r}
+task7$t1$ChenV(c(10,10))
+```
+
+Саму функцию можно получить
+
+```{r}
+task7$t1$ChenV
+```
+
+Вызов функции
+
+```{r}
+task7$t1$ChenV(c(1,1))
+```

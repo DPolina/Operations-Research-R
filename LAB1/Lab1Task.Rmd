@@ -1,0 +1,153 @@
+---
+title: Лабораторная работа 1. Задания
+author: "Дроздовская Полина"
+date: "19/03/2024"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: lualatex
+    includes:
+      in_header: preamble.tex
+---
+
+# Задача 1
+
+Постройте график функции и её производных $F=(x-5)^2+6x$. Найдите минимум функции.
+
+```{r}
+#install.packages("Deriv")
+
+library(Deriv)
+library(plotly)
+
+f <- function(x) (x-5)^2+6*x
+
+df <- Deriv(f, "x")
+d2f <- Deriv(df, "x")
+
+x <- seq(-45, 50, length.out=100)
+
+min<- optimize(f, c(-45, 50))$minimum
+
+cat("The minimum of the F(x): x =", min, "\n")
+
+```
+
+#### График функции F и её производных
+
+```{r}
+
+plot_ly(data.frame(x, f(x)), x= ~x, y=~f(x),type = 'scatter', mode = 'lines', text = "f(x)", name = 'f(x)') |>
+  add_trace(data.frame(x, df(x)), x= ~x, y=~df(x),type = 'scatter', mode = 'lines', text = "df(x)", name = 'df(x)') |>
+  add_trace(data.frame(x, d2f(x)), x= ~x, y=~d2f(x),type = 'scatter', mode = 'lines', text = "d2f(x)", name = 'd2f(x)') |>
+  add_trace(data.frame(min, f(min)), x= ~min, y=~f(min),type = 'scatter', mode = 'markers', text = "Min", name = 'Min')
+
+```
+
+# Задача 2
+
+Лампа висит над центром круглого стола радиуса $r$. Освещение прямо пропорционально косинусу угла падения световых лучей и обратно пропорционально квадрату расстояния до источника света. На какой высоте лампы над столом $x$ освещение предмета, лежащего на краю стола, будет наилучшим? Пусть $r=1 м.$ Постройте график зависимости освещенности от высоты подвеса светильника. Найдите производную этой функции и постройте ее график. ![Caption for the picture.](Img1.png)
+
+```{r}
+library(plotly)
+library(Deriv)
+
+# Параметры
+r <- 1 # Радиус стола
+
+# Функция освещенности
+f <- function(x) {
+  cosA <- x / sqrt(x^2 + r^2)
+  cosA / (x^2 + r^2)
+}
+
+df <- Deriv(f, "x")
+
+# Высота лампы
+x <- seq(0, 5, length=100)
+
+max<- optimize(F, c(0, 10), maximum = TRUE)$maximum
+
+# Построение графика
+plot_ly(data.frame(x, f(x)), x=~x, y=~f(x), type = 'scatter', mode = 'lines', text = "f(x)", name = 'f(x)') |>
+  add_trace(data.frame(x, df(x)), x= ~x, y=~df(x),type = 'scatter', mode = 'lines', text = "df(x)", name = 'df(x)') |>
+  add_trace(data.frame(max, f(max)), x= ~max, y=~f(max),type = 'scatter', mode = 'markers', text = "Max", name = 'Max')
+
+```
+
+# Задача 3
+
+Постройте объемный и контурный графики функции $F=3x^2+xy+2y^2-x-4y$. Найдите частные производные. Определите точки максимума, минимума и перегиба.
+
+#### Объемный график
+
+```{r}
+f <- function(x, y) 3*x^2+x*y+2*y^2-x-4*y
+
+x <- y <- seq(-5, 5, length.out = 20)
+z <- outer(x, y, FUN = function(x,y) { f(x,y) })  |> t()
+plot_ly(z = ~z) |> add_surface()
+
+```
+
+#### Контурный график
+
+```{r}
+x <- y <- seq(-5, 5, length.out = 20)
+z <- outer(x, y, FUN = function(x,y) { f(x,y) })  |> t()
+plot_ly(x=~x, y=~y, z=~z, type="contour")
+```
+
+#### Частные производные
+
+```{r}
+dfx <- Deriv(f, "x"); dfx
+dfy <- Deriv(f, "y"); dfy
+
+result <- optim(c(x, y), function(vec) f(vec[1], vec[2]))
+
+```
+
+# Задача 4
+
+Найдите частные производные функции $F=xy$ и точку, где они равны 0. Постройте объемный и контурный график. Какие особые точки вы можете выделить.
+
+```{r}
+library(Deriv)
+
+# Функция F(x, y)
+f <- function(x, y) x * y
+
+# Частные производные
+dfx <- Deriv(f, "x"); dfx
+dfy <- Deriv(f, "y"); dfy
+
+# Точка, где частные производные равны 0
+extremum <- data.frame(x = 0, y = 0);
+
+# Область определения
+x <- seq(-5, 5, length = 20)
+y <- seq(-5, 5, length = 20)
+```
+
+#### Объемный график
+
+```{r}
+x <- y <- seq(-5, 5, length.out = 20)
+z <- outer(x, y, FUN = f)  |> t()
+plot_ly(x=~x, y=~y,z = ~z) |> add_surface()
+```
+
+#### Контурный график
+
+```{r}
+x <- y <- seq(-5, 5, length.out = 20)
+z <- outer(x, y, FUN = function(x,y) { f(x,y) })  |> t()
+plot_ly(x=x, y=y, z=z, type="contour")
+
+result <- optim(c(x, y), function(vec) f(vec[1], vec[2]))
+
+
+```
